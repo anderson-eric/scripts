@@ -1,0 +1,227 @@
+#!/bin/bash
+
+# Usage:
+# switch_config_collector [report] [report_on_success]
+#	no parameters     : produces debug output; does not email the report
+#	report            : emails report on warnings and errors
+#	report_on_success : emails report on success, warnings and errors
+
+HOME=/data/switch_config_collector
+BIN=$HOME/bin
+ETC=$HOME/etc
+LOGS=$HOME/logs
+LAST=$HOME/switch_configs/last
+PREVIOUS=$HOME/switch_configs/previous
+PORTSTATUS=$HOME/switch_configs/last_port_status
+BYDEVICE=$HOME/switch_configs/by_device
+
+TS=`date "+%Y%m%d_%H%M%S"`
+ID=$ETC/private_openssh.key
+LOG=$LOGS/${TS}.txt
+EMAILBODY=$LOGS/emailbody.txt
+cat /dev/null > $EMAILBODY
+COMMUNITY=HQRW
+STATUS=0
+SERVER=mail.usres.com
+SENDER=root@cacti.hq.usres.com
+#RECIPIENT="eric.anderson@usres.com"
+RECIPIENT="info.it@usres.com"
+DEBUG=0
+
+if [ "$1" == "" ]; then DEBUG=1; fi
+echo Script started with parameters \"$1\" >> $LOG
+if [ $DEBUG == 1 ]; then
+    echo Script started with parameters \"$1\"
+fi
+
+for SWITCH in       \
+	IRVEXTSW05  \
+	IRVEXTSW06  \
+	IRVCORESW01 \
+	IRVCORESW02 \
+	IRVSRVSW48  \
+	IRVSRVSW49  \
+	IRVSRVSW50  \
+	IRVSRVSW51  \
+	\
+	LFCORESW06  \
+	LFCORESW07  \
+	LFSRVSW73   \
+	LFSRVSW74   \
+	LFSRVSW78   \
+	LFUSRSW80   \
+	LFUSRSW81   \
+	LFUSRSW82   \
+	LFUSRSW90   \
+	LFUSRSW91   \
+	LFUSRSW92   \
+	\
+	DRSRVSW02   \
+	DRCORESW01  \
+	; do
+
+    # a. Add header info to logs
+    echo "========================================================" >> $LOG
+    echo `date "+%Y/%m/%d %H:%M:%S"` Processing switch $SWITCH ...  >> $LOG
+    if [ $DEBUG == 1 ]; then
+        echo `date "+%Y/%m/%d %H:%M:%S"` Processing switch $SWITCH ...
+    fi
+    CURSTATUS=0
+
+    /bin/mkdir -p $BYDEVICE/$SWITCH
+
+    # 1. Copy the startup config to the device folder.
+    #    Note: sometimes the switch closes the scp connection resulting in a non-zero return code.
+    #    If the downloaded file is complete (ie last line is "password operator"), then reset "RC" to 0. 
+    /usr/bin/scp -i $ID admin@${SWITCH}:/cfg/startup-config $BYDEVICE/$SWITCH/${TS}_startup.txt >> $LOG 2>&1
+    RC=$?
+
+    TEST_STRING=`tail -2 $BYDEVICE/$SWITCH/${TS}_startup.txt 2> /dev/null | head -1`
+    if [ $RC != 0 ]  &&  
+       [ -e $BYDEVICE/$SWITCH/${TS}_startup.txt ] &&
+       [ "$TEST_STRING" == "password operator" ] ; then
+	RC=0
+    fi
+    if [ $RC != 0 ]; then
+	echo "!!! Error $RC collecting startup-config from switch $SWITCH." >> $LOG
+	echo "!!! Error $RC collecting startup-config from switch $SWITCH." >> $EMAILBODY
+        if [ $DEBUG == 1 ]; then
+	    echo "!!! Error $RC collecting startup-config from switch $SWITCH."
+        fi
+        CURSTATUS=2
+	continue
+    fi
+
+    # 2. Copy the running config to device folder.
+    /usr/bin/scp -i $ID admin@${SWITCH}:/cfg/running-config $BYDEVICE/$SWITCH/${TS}_running.txt >> $LOG 2>&1
+    RC=$?
+    TEST_STRING=`tail -2 $BYDEVICE/$SWITCH/${TS}_running.txt 2> /dev/null | head -1`
+    if [ $RC != 0 ] &&
+       [ -e $BYDEVICE/$SWITCH/${TS}_running.txt ] &&
+       [ "$TEST_STRING" == "password operator" ] ; then
+        RC=0
+    fi
+    if [ $RC != 0 ]; then
+        echo "!!! Error $RC collecting running-config from switch $SWITCH." >> $LOG
+        echo "!!! Error $RC collecting running-config from switch $SWITCH." >> $EMAILBODY
+        if [ $DEBUG ==1 ]; then
+             echo "!!! Error $RC collecting startup-config from switch $SWITCH."
+        fi
+        CURSTATUS=2
+        continue
+    fi
+    # 3. Check for uncommitted changes on the switch.
+    /usr/bin/diff -u $BYDEVICE/$SWITCH/${TS}_startup.txt $BYDEVICE/$SWITCH/${TS}_running.txt >> $LOG 2>&1
+    if [ $? != 0 ]; then
+	echo "!!! Warning: uncommitted configuration changes on switch $SWITCH." >> $LOG
+	echo "!!! Warning: uncommitted configuration changes on switch $SWITCH." >> $EMAILBODY
+        if [ $DEBUG == 1 ]; then
+	    echo "!!! Warning: uncommitted configuration changes on switch $SWITCH."
+        fi
+        if [ $CURSTATUS == 0 ]; then 
+	      CURSTATUS=1
+	fi
+    fi
+
+    if [ ! -e $LAST/${SWITCH}.txt ]; then
+	/bin/cp $BYDEVICE/$SWITCH/${TS}_running.txt $LAST/${SWITCH}.txt >> $LOG 2>&1
+    fi
+
+    # 4. DIFF startup-config with running-config to see if it changed.
+    /usr/bin/diff -u $LAST/${SWITCH}.txt $BYDEVICE/$SWITCH/${TS}_running.txt >> $LOG 2>&1
+    if [ $? != 0 ]; then
+	echo "!!! Warning: switch $SWITCH configuration has changed." >> $LOG
+	echo "!!! Warning: switch $SWITCH configuration has changed." >> $EMAILBODY
+        if [ $DEBUG == 1 ]; then
+	    echo "!!! Warning: switch $SWITCH configuration has changed."
+        fi
+        if [ $CURSTATUS == 0 ]; then 
+	    CURSTATUS=1
+	fi
+	/bin/cp $LAST/${SWITCH}.txt $PREVIOUS/${SWITCH}.txt >> $LOG 2>&1
+	/bin/cp $BYDEVICE/$SWITCH/${TS}_running.txt $LAST/${SWITCH}.txt     >> $LOG 2>&1
+    fi
+
+
+    # 5. Report on interface up/down status.
+    TMPFILE=`mktemp`
+    RC=0
+    /usr/bin/snmpwalk -v2c -c $COMMUNITY $SWITCH IF-MIB::ifOperStatus >> $TMPFILE 2>> $LOG
+    RC2=$?
+    if [ $RC -lt $RC2 ]; then RC=$RC2; fi
+    /usr/bin/snmpwalk -v2c -c $COMMUNITY $SWITCH IF-MIB::ifType       >> $TMPFILE 2>> $LOG
+    RC2=$?
+    if [ $RC -lt $RC2 ]; then RC=$RC2; fi
+    /usr/bin/snmpwalk -v2c -c $COMMUNITY $SWITCH IF-MIB::ifAlias      >> $TMPFILE 2>> $LOG
+    RC2=$?
+    if [ $RC -lt $RC2 ]; then RC=$RC2; fi
+    sort -k 2 -t . -n $TMPFILE > $BYDEVICE/$SWITCH/${TS}_port_status.txt 2>> $LOG
+    rm -f $TMPFILE
+    if [ $RC != 0 ]; then
+	echo "!!! Error $RC collecting port status from switch $SWITCH." >> $LOG
+	echo "!!! Error $RC collecting port status from switch $SWITCH." >> $EMAILBODY
+        if [ $DEBUG == 1 ]; then
+	    echo "!!! Error $RC collecting port status from switch $SWITCH."
+        fi
+        CURSTATUS=2
+	continue
+    fi
+
+    if [ ! -e $PORTSTATUS/${SWITCH}.txt ]; then
+	/bin/cp $BYDEVICE/$SWITCH/${TS}_port_status.txt $PORTSTATUS/${SWITCH}.txt >> $LOG 2>&1
+    fi
+
+    /usr/bin/diff -u $SCC_PORTSTATUS/${SWITCH}.txt $BYDEVICE/$SWITCH/${TS}_port_status.txt >> $LOG 2>&1
+    if [ $? != 0 ]; then
+	echo "!!! Warning: port status has changed on switch $SWITCH." >> $LOG
+	echo "!!! Warning: port status has changed on switch $SWITCH." >> $EMAILBODY
+        if [ $DEBUG == 1 ]; then
+	    echo "!!! Warning: port status has changed on switch $SWITCH."
+        fi
+        if [ $CURSTATUS == 0 ]; then 
+	    CURSTATUS=1
+	fi
+	/bin/cp $BYDEVICE/$SWITCH/${TS}_port_status.txt $PORTSTATUS/${SWITCH}.txt >> $LOG 2>&1
+    fi
+
+    if [ $CURSTATUS -gt $STATUS ] ; then STATUS=$CURSTATUS; fi
+    echo `date "+%Y/%m/%d %H:%M:%S"` ... done. Current status $CURSTATUS. Overall status $STATUS. >> $LOG
+    if [ $DEBUG == 1 ]; then
+        echo `date "+%Y/%m/%d %H:%M:%S"` ... $SWITCH done. Current status $CURSTATUS. Overall status $STATUS.
+    fi
+
+done
+
+
+echo "" >> $LOG
+echo "========================================================" >> $LOG
+pushd $LAST > /dev/null
+pwd >> $LOG
+
+# 6. Email the configurations after zipping with status.
+if [ -e last_config.zip ]; then /bin/rm -f last_config.zip >> $LOG 2>&1; fi 
+/usr/bin/zip last_config.zip *.txt >> $LOG 2>&1
+popd > /dev/null
+
+if [ $CURSTATUS -gt $STATUS ] ; then $STATUS=$CURSTATUS; fi
+echo Script completed with STATUS=$STATUS. See log file for details: $LOG >> $LOG
+
+if [ $DEBUG == 1 ]; then
+    echo Script completed with STATUS=$STATUS. See log file for details: $LOG
+fi
+
+if [ $STATUS == 0 ]; then  SUBJECT="Switch Config Collector: SUCCESS"; fi
+if [ $STATUS == 1 ]; then  SUBJECT="Switch Config Collector: WARNING"; fi
+if [ $STATUS == 2 ]; then  SUBJECT="Switch Config Collector: ERROR";   fi
+
+if [ "$1" == "report_on_success" ] ||
+   ( [ "$1" == "report" ] && [ $STATUS -gt 0 ] ) ; then
+    echo Emailing report to $RECIPIENT >> $LOG
+    if [ $DEBUG == 1 ] ; then
+        echo Emailing report to $RECIPIENT
+    fi
+    /bin/cat $EMAILBODY | $BIN/sendEmail.pl -s $SERVER -f $SENDER -u $SUBJECT \
+		-a $LOG -a $LAST/last_config.zip -t $RECIPIENT >> $LOG 2>&1
+fi
+
+# 7. Complete!
